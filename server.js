@@ -105,15 +105,20 @@ const isValidCoord = (lat, lon) =>
 // --- strategy: distance ---------------------------------------------------
 // Pair iff distance <= min(rangeA, rangeB). Symmetric; recomputing the moved
 // client captures every pair involving it. Emits peer-joined/left diffs.
-function eligible(a, b) {
+// Hysteresis: pair when within the range, but keep an existing pair until it
+// drifts 20% past it. Without this, GPS jitter at the boundary flaps peers
+// connect/disconnect on every location update.
+const HYSTERESIS = 1.2;
+function eligible(a, b, alreadyPaired) {
   if (a.lat == null || b.lat == null) return false;
-  return haversine(a.lat, a.lon, b.lat, b.lon) <= Math.min(a.range, b.range);
+  const limit = Math.min(a.range, b.range) * (alreadyPaired ? HYSTERESIS : 1);
+  return haversine(a.lat, a.lon, b.lat, b.lon) <= limit;
 }
 function recompute(id) {
   const a = clients.get(id);
   if (!a) return;
   const want = new Set();
-  if (a.lat != null) for (const [bid, b] of clients) if (bid !== id && eligible(a, b)) want.add(bid);
+  if (a.lat != null) for (const [bid, b] of clients) if (bid !== id && eligible(a, b, a.peers.has(bid))) want.add(bid);
   for (const bid of want) if (!a.peers.has(bid)) {
     a.peers.add(bid); clients.get(bid).peers.add(id);
     sendTo(id, { type: "peer-joined", id: bid, name: nameOf(bid) });
@@ -191,6 +196,7 @@ wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
   clients.set(id, { ws, lat: null, lon: null, range: DEFAULT_RANGE, name: "anon", peers: new Set(), geohash: null, lastSwitch: 0 });
   send(ws, { type: "welcome", id });
+  console.log(`conn ${id.slice(0, 6)} (total ${clients.size})`);
 
   ws.on("message", (raw) => {
     let msg;
@@ -199,27 +205,43 @@ wss.on("connection", (ws) => {
     const c = clients.get(id);
     if (!c) return;
 
-    switch (msg.type) {
-      case "join":
-        c.name = cleanName(msg.name);
-        if (msg.range != null) c.range = clampRange(Number(msg.range));
-        break;
-      case "loc":
-        if (isValidCoord(msg.lat, msg.lon)) onLoc(id, msg.lat, msg.lon);
-        break;
-      case "range":
-        onRange(id, Number(msg.range));
-        break;
-      case "signal":
-        if (typeof msg.to === "string") sendTo(msg.to, { type: "signal", from: id, data: msg.data });
-        break;
-      default:
-        break;
+    // Guard: a throw here used to kill the socket silently. Log and survive.
+    try {
+      switch (msg.type) {
+        case "join":
+          c.name = cleanName(msg.name);
+          if (msg.range != null) c.range = clampRange(Number(msg.range));
+          console.log(`join ${id.slice(0, 6)} name=${c.name} range=${c.range}`);
+          break;
+        case "loc":
+          if (isValidCoord(msg.lat, msg.lon)) {
+            onLoc(id, msg.lat, msg.lon);
+            console.log(`loc  ${id.slice(0, 6)} peers=${c.peers.size}`);
+          }
+          break;
+        case "range":
+          onRange(id, Number(msg.range));
+          console.log(`range ${id.slice(0, 6)} -> ${c.range} peers=${c.peers.size}`);
+          break;
+        case "signal":
+          if (typeof msg.to === "string") sendTo(msg.to, { type: "signal", from: id, data: msg.data });
+          break;
+        default:
+          break;
+      }
+    } catch (err) {
+      console.error(`ERR handling ${msg.type} from ${id.slice(0, 6)}:`, err);
     }
   });
 
-  ws.on("close", () => { onLeave(id); clients.delete(id); });
-  ws.on("error", () => { onLeave(id); clients.delete(id); });
+  ws.on("close", (code, reason) => {
+    onLeave(id); clients.delete(id);
+    console.log(`close ${id.slice(0, 6)} code=${code} reason=${reason || ""} (total ${clients.size})`);
+  });
+  ws.on("error", (err) => {
+    onLeave(id); clients.delete(id);
+    console.log(`error ${id.slice(0, 6)}: ${err && err.message}`);
+  });
 });
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
