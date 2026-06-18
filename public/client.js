@@ -6,8 +6,15 @@
 // --- config ---------------------------------------------------------------
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
-  // ponytail: STUN-only works for most NATs. Symmetric-NAT peers need a TURN
-  // relay (coturn) — defer. Add credentialed turn:/turns: entries here.
+  { urls: "stun:stun.relay.metered.ca:80" },
+  // Best-effort free TURN (Metered OpenRelay). Relays media only for peers that
+  // can't connect directly (symmetric NAT). Public + rate-limited — if it's
+  // down the browser just falls back to STUN/host, nothing breaks.
+  // ponytail: for reliable TURN, swap these for your own free Metered key
+  // (50GB/mo) or fetch ephemeral creds at runtime.
+  { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
 ];
 const LOC_THROTTLE_MS = 15000;
 const SELF = "__self__";
