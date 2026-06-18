@@ -82,6 +82,23 @@
   }
   #muteBtn.muted { background: var(--danger); color: #2a0f14; border-color: transparent; }
 
+  /* range +/- cluster, bottom-right corner of the scope */
+  .rangectl {
+    position: absolute; right: 12px; bottom: 12px; z-index: 2;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .rangectl .rv {
+    min-width: 64px; text-align: center; font-size: 0.7rem; letter-spacing: 0.1em;
+    color: var(--green); text-shadow: 0 0 8px rgba(68,255,153,0.7);
+  }
+  .rbtn {
+    width: 30px; height: 30px; line-height: 1; font-size: 1.2rem;
+    border: 1px solid var(--stroke); background: rgba(0,0,0,0.5); color: var(--green);
+    border-radius: 8px; cursor: pointer; display: grid; place-items: center;
+  }
+  .rbtn:active { transform: scale(0.92); }
+  .rbtn:disabled { opacity: 0.3; cursor: not-allowed; }
+
   .status { text-align: center; color: var(--muted); margin: 10px 0 0; font-size: 0.82rem; letter-spacing: 0.04em; }
   .status.error { color: var(--danger); }
 
@@ -113,6 +130,11 @@
     <div class="stage">
       <canvas id="scene"></canvas>
       <button id="muteBtn">Mute</button>
+      <div class="rangectl">
+        <button id="rangeDown" class="rbtn" title="shrink range">-</button>
+        <span id="rangeVal" class="rv">150 M</span>
+        <button id="rangeUp" class="rbtn" title="grow range">+</button>
+      </div>
     </div>
   </section>
 

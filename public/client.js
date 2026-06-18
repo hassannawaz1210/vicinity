@@ -11,6 +11,15 @@ const ICE_SERVERS = [
 ];
 const LOC_THROTTLE_MS = 15000;
 const SELF = "__self__";
+// range in metres: 10 m floor, whole-planet ceiling, round-number grid.
+const RANGE_MIN = 10;
+const GLOBAL = 20015000;            // half Earth's circumference
+const DEFAULT_RANGE = 150;
+// step scales with magnitude so +/- stays a "reasonable" jump at every zoom
+const stepFor = (v) =>
+  v < 1000 ? 100 : v < 10000 ? 1000 : v < 100000 ? 10000 : v < 1000000 ? 100000 : 1000000;
+const fmtRange = (m) =>
+  m >= GLOBAL ? "GLOBAL" : m >= 1000 ? `${m / 1000} KM` : `${m} M`;
 
 // --- DOM ------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -22,6 +31,9 @@ const joinBtn = $("joinBtn");
 const muteBtn = $("muteBtn");
 const statusEl = $("status");
 const canvas = $("scene");
+const rangeUpBtn = $("rangeUp");
+const rangeDownBtn = $("rangeDown");
+const rangeVal = $("rangeVal");
 const audioContainer = $("audioContainer");
 
 // --- state ----------------------------------------------------------------
@@ -29,6 +41,8 @@ let myId = null, myName = "", ws = null, localStream = null;
 let muted = false, joined = false, reconnectUsed = false;
 let lastLocSent = 0;
 let audioCtx = null;
+let range = DEFAULT_RANGE;   // current search range in metres
+let rangeSendTimer = null;
 const meters = [];           // { analyser, data, part }
 
 // participant: { id, name, isSelf, level } — level is smoothed RMS 0..1
@@ -55,6 +69,22 @@ shuffleBtn.addEventListener("click", () => { nameInput.value = randomName(); });
 nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") onJoin(); });
 joinBtn.addEventListener("click", onJoin);
 muteBtn.addEventListener("click", toggleMute);
+
+function setRange(next) {
+  next = Math.min(GLOBAL, Math.max(RANGE_MIN, next));
+  if (next === range) return;
+  range = next;
+  rangeVal.textContent = fmtRange(range);
+  rangeDownBtn.disabled = range <= RANGE_MIN;
+  rangeUpBtn.disabled = range >= GLOBAL;
+  pulseAt = nowT;                       // kick the re-scan animation
+  clearTimeout(rangeSendTimer);         // debounce rapid taps
+  rangeSendTimer = setTimeout(() => send({ type: "range", range }), 250);
+}
+// step to the next/previous round multiple of the current band's step
+rangeUpBtn.addEventListener("click", () => { const s = stepFor(range); setRange((Math.floor(range / s) + 1) * s); });
+rangeDownBtn.addEventListener("click", () => { const s = stepFor(range - 1); setRange((Math.ceil(range / s) - 1) * s); });
+rangeVal.textContent = fmtRange(range);
 
 if (!window.isSecureContext) {
   setStatus("Open this over HTTPS (or localhost) to use the mic and location.", "error");
@@ -116,7 +146,7 @@ function wsUrl() {
 function connect() {
   try { ws = new WebSocket(wsUrl()); }
   catch (err) { setStatus("Could not open connection: " + ((err && err.message) || err), "error"); return; }
-  ws.addEventListener("open", () => { reconnectUsed = false; send({ type: "join", name: myName }); });
+  ws.addEventListener("open", () => { reconnectUsed = false; send({ type: "join", name: myName, range }); });
   ws.addEventListener("message", (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     handleMessage(msg);
@@ -274,7 +304,8 @@ function toggleMute() {
 //  RENDERER — one rAF loop drawing the sonar scope
 // ==========================================================================
 const ctx = canvas.getContext("2d");
-let dpr = 1, W = 0, H = 0, t0 = 0;
+let dpr = 1, W = 0, H = 0, t0 = 0, nowT = 0;
+let pulseAt = -10;         // time of last range change, for the re-scan pulse
 const ripples = new Map(); // partId -> ripple phase accumulator (sonar)
 let started = false;
 
@@ -297,6 +328,7 @@ function startRenderer() {
 function frame(t) {
   if (!t0) t0 = t;
   const time = (t - t0) / 1000;
+  nowT = time;
   pumpMeters();
   ctx.clearRect(0, 0, W, H);
   drawSonar(time);
@@ -308,11 +340,26 @@ function drawSonar(time) {
   const cx = W / 2, cy = H / 2, R = Math.min(W, H) * 0.44;
   ctx.fillStyle = "#01040a"; ctx.fillRect(0, 0, W, H);
 
-  // range rings + crosshairs
+  // range rings + crosshairs, each labelled with its distance fraction
   ctx.strokeStyle = "rgba(68,255,153,0.18)"; ctx.lineWidth = 1;
-  for (let i = 1; i <= 4; i++) { ctx.beginPath(); ctx.arc(cx, cy, R * i / 4, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.font = "9px " + getMono(); ctx.textBaseline = "bottom"; ctx.textAlign = "left";
+  for (let i = 1; i <= 4; i++) {
+    const rr = R * i / 4;
+    ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = "rgba(68,255,153,0.35)";
+    ctx.fillText(fmtRange(Math.round(range * i / 4)), cx + 3, cy - rr - 1);
+  }
   ctx.beginPath(); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
   ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R); ctx.stroke();
+
+  // re-scan pulse: a bright ring sweeps out from center when range changes
+  const since = nowT - pulseAt;
+  if (since >= 0 && since < 0.85) {
+    const k = since / 0.85;
+    ctx.strokeStyle = `rgba(120,255,180,${0.6 * (1 - k)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, cy, k * R, 0, Math.PI * 2); ctx.stroke();
+  }
 
   // sweep with afterglow fan
   const sweep = time * 1.1 % (Math.PI * 2);
@@ -385,9 +432,6 @@ function drawHud(time) {
   ctx.fillStyle = col; ctx.font = "11px " + getMono(); ctx.textAlign = "left";
   const dot = Math.floor(time * 2) % 2 ? ">" : " ";
   ctx.fillText(`${dot} ${(hud.msg || "").toUpperCase()}`, 12, 12);
-  // bottom-left: range label, radar flavor
-  ctx.fillStyle = "rgba(68,255,153,0.4)"; ctx.textBaseline = "bottom";
-  ctx.fillText("RANGE 150M", 12, H - 12);
 }
 
 // --- shared CRT overlay ---------------------------------------------------

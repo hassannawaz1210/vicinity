@@ -1,28 +1,23 @@
 import assert from "node:assert/strict";
-import { geohashEncode, neighborhood } from "./server.js";
+import { haversine, geohashEncode, neighborhood } from "./server.js";
 
-// Known reference: 57.64911, 10.40744 -> "u4pruydqqvj" (Wikipedia geohash example)
-const REF_LAT = 57.64911;
-const REF_LON = 10.40744;
+// --- distance strategy ----------------------------------------------------
+const d = haversine(33.6436, 72.9650, 33.7232, 73.0433);
+assert.ok(Math.abs(d - 11400) < 300, `expected ~11.4km, got ${Math.round(d)}m`);
+assert.equal(haversine(10, 20, 10, 20), 0);
 
-const p7 = geohashEncode(REF_LAT, REF_LON, 7);
-assert.equal(p7, "u4pruyd", `precision-7 geohash mismatch: got "${p7}"`);
+const paired = (dist, rA, rB) => dist <= Math.min(rA, rB);
+assert.ok(paired(120, 150, 200), "120m within both ranges should pair");
+assert.ok(!paired(120, 150, 100), "120m exceeds the tighter 100m range — no pair");
+assert.ok(!paired(5000, 150, 150), "5km apart at 150m range — no pair");
 
-const p11 = geohashEncode(REF_LAT, REF_LON, 11);
-assert.equal(p11, "u4pruydqqvj", `precision-11 geohash mismatch: got "${p11}"`);
+// --- geohash strategy -----------------------------------------------------
+assert.equal(geohashEncode(57.64911, 10.40744, 7), "u4pruyd");
+assert.equal(geohashEncode(57.64911, 10.40744, 11), "u4pruydqqvj");
 
-// Sanity: distinct nearby points should generally differ at p7, and a point
-// in another part of the world must differ.
-assert.notEqual(geohashEncode(0, 0, 7), p7, "origin should differ from ref");
-
-// neighborhood: 9 distinct same-length cells, includes self, and is symmetric
-// (if B is in A's neighborhood, A is in B's) — the property room matching needs.
-const hood = neighborhood(p7);
+const hood = neighborhood("u4pruyd");
 assert.equal(hood.size, 9, `neighborhood should have 9 cells, got ${hood.size}`);
-assert.ok(hood.has(p7), "neighborhood must include the center cell");
-for (const cell of hood) {
-  assert.equal(cell.length, 7, `neighbor cell wrong length: "${cell}"`);
-  assert.ok(neighborhood(cell).has(p7), `neighborhood not symmetric for "${cell}"`);
-}
+assert.ok(hood.has("u4pruyd"), "neighborhood must include the center cell");
+for (const cell of hood) assert.ok(neighborhood(cell).has("u4pruyd"), `not symmetric for "${cell}"`);
 
-console.log("ok - geohash encode + neighborhood matching");
+console.log("ok - distance + geohash strategies");

@@ -8,39 +8,46 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.PORT) || 9966;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
-const GEOHASH_PRECISION = 7;
-const SWITCH_COOLDOWN_MS = 5000; // see debounce note on handleLoc
 
-// --- geohash encode (standard base32 algorithm) ----------------------------
+// Matching strategy — switch with MATCH_MODE=distance|geohash (default distance).
+// Both are kept so we can A/B them before committing to one.
+const MODE = (process.env.MATCH_MODE || "distance").toLowerCase() === "geohash" ? "geohash" : "distance";
+
+const RANGE_MIN = 10;        // metres — tightest "vicinity" (distance mode)
+const RANGE_MAX = 20015000;  // metres — half Earth's circumference = whole planet
+const DEFAULT_RANGE = 150;
+const GEOHASH_PRECISION = 7; // ~150m cell (geohash mode)
+const SWITCH_COOLDOWN_MS = 5000;
+
+// --- distance (great-circle) ----------------------------------------------
+export function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000, rad = (x) => (x * Math.PI) / 180;
+  const dLat = rad(lat2 - lat1), dLon = rad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+const clampRange = (r) =>
+  Number.isFinite(r) ? Math.min(RANGE_MAX, Math.max(RANGE_MIN, r)) : DEFAULT_RANGE;
+
+// --- geohash (cell bucketing) ---------------------------------------------
 const BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
 export function geohashEncode(lat, lon, precision = GEOHASH_PRECISION) {
   let latMin = -90, latMax = 90, lonMin = -180, lonMax = 180;
-  let hash = "";
-  let bit = 0, ch = 0, even = true;
+  let hash = "", bit = 0, ch = 0, even = true;
   while (hash.length < precision) {
     if (even) {
       const mid = (lonMin + lonMax) / 2;
-      if (lon >= mid) { ch = (ch << 1) | 1; lonMin = mid; }
-      else { ch = ch << 1; lonMax = mid; }
+      if (lon >= mid) { ch = (ch << 1) | 1; lonMin = mid; } else { ch = ch << 1; lonMax = mid; }
     } else {
       const mid = (latMin + latMax) / 2;
-      if (lat >= mid) { ch = (ch << 1) | 1; latMin = mid; }
-      else { ch = ch << 1; latMax = mid; }
+      if (lat >= mid) { ch = (ch << 1) | 1; latMin = mid; } else { ch = ch << 1; latMax = mid; }
     }
     even = !even;
-    if (++bit === 5) {
-      hash += BASE32[ch];
-      bit = 0;
-      ch = 0;
-    }
+    if (++bit === 5) { hash += BASE32[ch]; bit = 0; ch = 0; }
   }
   return hash;
 }
-
-// --- geohash neighbors -------------------------------------------------------
-// Two clients share a room if their cells are equal OR adjacent — so people
-// straddling a cell boundary (or with slightly disagreeing GPS/wifi fixes)
-// still find each other. Standard geohash-js adjacency tables.
 const NEIGHBOR = {
   n: ["p0r21436x8zb9dcf5h7kjnmqesgutwvy", "bc01fg45238967deuvhjyznpkmstqrwx"],
   s: ["14365h7k9dcfesgujnmqp0r2twvyx8zb", "238967debc01fg45kmstqrwxuvhjyznp"],
@@ -48,12 +55,10 @@ const NEIGHBOR = {
   w: ["238967debc01fg45kmstqrwxuvhjyznp", "14365h7k9dcfesgujnmqp0r2twvyx8zb"],
 };
 const BORDER = {
-  n: ["prxz", "bcfguvyz"], s: ["028b", "0145hjnp"],
-  e: ["bcfguvyz", "prxz"], w: ["0145hjnp", "028b"],
+  n: ["prxz", "bcfguvyz"], s: ["028b", "0145hjnp"], e: ["bcfguvyz", "prxz"], w: ["0145hjnp", "028b"],
 };
 function adjacent(hash, dir) {
-  const last = hash.charAt(hash.length - 1);
-  const type = hash.length % 2;
+  const last = hash.charAt(hash.length - 1), type = hash.length % 2;
   let parent = hash.slice(0, -1);
   if (BORDER[dir][type].indexOf(last) !== -1 && parent !== "") parent = adjacent(parent, dir);
   return parent + BASE32.charAt(NEIGHBOR[dir][type].indexOf(last));
@@ -61,171 +66,162 @@ function adjacent(hash, dir) {
 export function neighborhood(hash) {
   if (!hash) return new Set();
   const n = adjacent(hash, "n"), s = adjacent(hash, "s"), e = adjacent(hash, "e"), w = adjacent(hash, "w");
-  return new Set([hash, n, s, e, w,
-    adjacent(n, "e"), adjacent(n, "w"), adjacent(s, "e"), adjacent(s, "w")]);
+  return new Set([hash, n, s, e, w, adjacent(n, "e"), adjacent(n, "w"), adjacent(s, "e"), adjacent(s, "w")]);
 }
 
-// --- static file serving ----------------------------------------------------
+// --- static file serving --------------------------------------------------
 const CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
 };
-
 function serveStatic(req, res) {
   let urlPath = decodeURIComponent((req.url || "/").split("?")[0]);
   if (urlPath === "/") urlPath = "/index.html";
-  // normalize + confine to PUBLIC_DIR (block path traversal)
   const filePath = path.normalize(path.join(PUBLIC_DIR, urlPath));
   if (!filePath.startsWith(PUBLIC_DIR + path.sep) && filePath !== PUBLIC_DIR) {
     res.writeHead(404).end("Not found");
     return;
   }
   fs.readFile(filePath, (err, data) => {
-    if (err) {
-      res.writeHead(404, { "Content-Type": "text/plain" }).end("Not found");
-      return;
-    }
+    if (err) { res.writeHead(404, { "Content-Type": "text/plain" }).end("Not found"); return; }
     const type = CONTENT_TYPES[path.extname(filePath)] || "application/octet-stream";
     res.writeHead(200, { "Content-Type": type }).end(data);
   });
 }
-
 const server = http.createServer(serveStatic);
 
-// --- signaling state (in memory only) ---------------------------------------
-// clients: id -> { ws, geohash, lat, lon, lastSwitch }
+// --- shared state ---------------------------------------------------------
+// id -> { ws, lat, lon, range, name, peers:Set, geohash, lastSwitch }
 const clients = new Map();
+const nameOf = (id) => (clients.get(id) || {}).name || "anon";
+const cleanName = (raw) => String(raw || "").trim().slice(0, 24) || "anon";
+function send(ws, obj) { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); }
+function sendTo(id, obj) { const c = clients.get(id); if (c) send(c.ws, obj); }
+const isValidCoord = (lat, lon) =>
+  Number.isFinite(lat) && Number.isFinite(lon) &&
+  lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
 
-// Members of the room centered on `geohash` = clients in that cell or any of
-// its 8 neighbors. Symmetric, so A sees B iff B sees A.
+// --- strategy: distance ---------------------------------------------------
+// Pair iff distance <= min(rangeA, rangeB). Symmetric; recomputing the moved
+// client captures every pair involving it. Emits peer-joined/left diffs.
+function eligible(a, b) {
+  if (a.lat == null || b.lat == null) return false;
+  return haversine(a.lat, a.lon, b.lat, b.lon) <= Math.min(a.range, b.range);
+}
+function recompute(id) {
+  const a = clients.get(id);
+  if (!a) return;
+  const want = new Set();
+  if (a.lat != null) for (const [bid, b] of clients) if (bid !== id && eligible(a, b)) want.add(bid);
+  for (const bid of want) if (!a.peers.has(bid)) {
+    a.peers.add(bid); clients.get(bid).peers.add(id);
+    sendTo(id, { type: "peer-joined", id: bid, name: nameOf(bid) });
+    sendTo(bid, { type: "peer-joined", id, name: nameOf(id) });
+  }
+  for (const bid of [...a.peers]) if (!want.has(bid)) {
+    a.peers.delete(bid); const b = clients.get(bid); if (b) b.peers.delete(id);
+    sendTo(id, { type: "peer-left", id: bid });
+    sendTo(bid, { type: "peer-left", id });
+  }
+}
+function distanceLeave(id) {
+  const a = clients.get(id);
+  if (a) for (const bid of a.peers) {
+    const b = clients.get(bid);
+    if (b) { b.peers.delete(id); sendTo(bid, { type: "peer-left", id }); }
+  }
+}
+
+// --- strategy: geohash ----------------------------------------------------
+// Room = your cell + its 8 neighbors. Range is ignored in this mode.
 function roomMembers(geohash) {
   const near = neighborhood(geohash);
   const ids = [];
   for (const [id, c] of clients) if (c.geohash && near.has(c.geohash)) ids.push(id);
   return ids;
 }
-
-function nameOf(id) {
-  const c = clients.get(id);
-  return (c && c.name) || "anon";
-}
-
-// Trim + cap a client-supplied display name. textContent on the client side
-// handles escaping, so we only bound length here.
-function cleanName(raw) {
-  const s = String(raw || "").trim().slice(0, 24);
-  return s || "anon";
-}
-
-function send(ws, obj) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
-}
-
-function sendTo(id, obj) {
-  const c = clients.get(id);
-  if (c) send(c.ws, obj);
-}
-
-function leaveRoom(id) {
+function geohashLeave(id) {
   const c = clients.get(id);
   if (!c || !c.geohash) return;
   const old = c.geohash;
   c.geohash = null;
-  for (const otherId of roomMembers(old)) {
-    if (otherId !== id) sendTo(otherId, { type: "peer-left", id });
-  }
+  for (const otherId of roomMembers(old)) if (otherId !== id) sendTo(otherId, { type: "peer-left", id });
 }
-
-function enterRoom(id, geohash) {
+function geohashEnter(id, geohash) {
   const c = clients.get(id);
   if (!c) return;
   const peerIds = roomMembers(geohash).filter((x) => x !== id);
   c.geohash = geohash;
-  console.log(`enter ${id.slice(0, 6)} cell=${geohash} peers=${peerIds.length}`);
   send(c.ws, { type: "peers", peers: peerIds.map((pid) => ({ id: pid, name: nameOf(pid) })) });
   for (const otherId of peerIds) sendTo(otherId, { type: "peer-joined", id, name: nameOf(id) });
 }
-
-function isValidCoord(lat, lon) {
-  return (
-    Number.isFinite(lat) && Number.isFinite(lon) &&
-    lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
-  );
-}
-
-function handleLoc(id, lat, lon) {
+function geohashLoc(id, lat, lon) {
   const c = clients.get(id);
-  if (!c || !isValidCoord(lat, lon)) return;
-  c.lat = lat;
-  c.lon = lon;
+  if (!c) return;
   const gh = geohashEncode(lat, lon, GEOHASH_PRECISION);
-  if (gh === c.geohash) return; // same cell, nothing to do
-
-  // ponytail: crude time-based debounce — ignore a cell switch if we switched
-  // within the last few seconds, so GPS jitter on a cell boundary doesn't
-  // thrash rooms. Upgrade path: require the new cell to be reported N times
-  // (or stable for T ms) before committing, instead of a flat cooldown.
+  if (gh === c.geohash) return;
   const now = Date.now();
-  if (c.geohash && now - (c.lastSwitch || 0) < SWITCH_COOLDOWN_MS) return;
-
-  leaveRoom(id);
-  enterRoom(id, gh);
+  if (c.geohash && now - (c.lastSwitch || 0) < SWITCH_COOLDOWN_MS) return; // debounce jitter
+  geohashLeave(id);
+  geohashEnter(id, gh);
   c.lastSwitch = now;
 }
 
-// --- websocket layer ---------------------------------------------------------
-const wss = new WebSocketServer({ server });
+// --- dispatch -------------------------------------------------------------
+function onLoc(id, lat, lon) {
+  const c = clients.get(id);
+  if (!c) return;
+  c.lat = lat; c.lon = lon;
+  if (MODE === "geohash") geohashLoc(id, lat, lon); else recompute(id);
+}
+function onRange(id, r) {
+  const c = clients.get(id);
+  if (!c) return;
+  c.range = clampRange(r);
+  if (MODE === "distance") recompute(id);
+}
+function onLeave(id) {
+  if (MODE === "geohash") geohashLeave(id); else distanceLeave(id);
+}
 
+// --- websocket layer ------------------------------------------------------
+const wss = new WebSocketServer({ server });
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
-  clients.set(id, { ws, geohash: null, lat: null, lon: null, lastSwitch: 0, name: "anon" });
+  clients.set(id, { ws, lat: null, lon: null, range: DEFAULT_RANGE, name: "anon", peers: new Set(), geohash: null, lastSwitch: 0 });
   send(ws, { type: "welcome", id });
 
   ws.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return; // ignore malformed
-    }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (!msg || typeof msg !== "object") return;
+    const c = clients.get(id);
+    if (!c) return;
 
     switch (msg.type) {
-      case "join": {
-        // carries the display name; room is assigned on first valid "loc"
-        const c = clients.get(id);
-        if (c) c.name = cleanName(msg.name);
+      case "join":
+        c.name = cleanName(msg.name);
+        if (msg.range != null) c.range = clampRange(Number(msg.range));
         break;
-      }
       case "loc":
-        handleLoc(id, msg.lat, msg.lon);
+        if (isValidCoord(msg.lat, msg.lon)) onLoc(id, msg.lat, msg.lon);
+        break;
+      case "range":
+        onRange(id, Number(msg.range));
         break;
       case "signal":
-        // relay {type,to,from,data} -> {type:"signal",from,data}; drop if gone
-        if (typeof msg.to === "string") {
-          sendTo(msg.to, { type: "signal", from: id, data: msg.data });
-        }
+        if (typeof msg.to === "string") sendTo(msg.to, { type: "signal", from: id, data: msg.data });
         break;
       default:
-        break; // ignore unknown types
+        break;
     }
   });
 
-  ws.on("close", () => {
-    leaveRoom(id);
-    clients.delete(id);
-  });
-
-  ws.on("error", () => {
-    leaveRoom(id);
-    clients.delete(id);
-  });
+  ws.on("close", () => { onLeave(id); clients.delete(id); });
+  ws.on("error", () => { onLeave(id); clients.delete(id); });
 });
 
-// Only start listening when run directly (not when imported by test.js).
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  server.listen(PORT, () => {
-    console.log(`Vicinity signaling server listening on :${PORT}`);
-  });
+  server.listen(PORT, () => console.log(`Vicinity server on :${PORT} (match mode: ${MODE})`));
 }
