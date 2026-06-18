@@ -287,6 +287,8 @@ function attachRemoteAudio(peerId, stream) {
     if (part) attachMeter(stream, part);
   }
   entry.audio.srcObject = stream;
+  const part = parts.get(peerId);
+  entry.audio.muted = !!(part && part.muted); // honor an existing mute
   entry.audio.play && entry.audio.play().catch(() => {});
 }
 function closePeer(peerId) {
@@ -329,9 +331,26 @@ function startRenderer() {
   started = true;
   resize();
   window.addEventListener("resize", resize);
-  canvas.addEventListener("pointerdown", () => { if (audioCtx && audioCtx.state === "suspended") audioCtx.resume(); });
+  canvas.addEventListener("pointerdown", onScenePointer);
   requestAnimationFrame(frame);
 }
+// Tap a peer's blip to mute/unmute that person (silences their incoming audio).
+function onScenePointer(ev) {
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+  const r = canvas.getBoundingClientRect();
+  const px = ev.clientX - r.left, py = ev.clientY - r.top;
+  let hit = null, best = 24 * 24; // within ~24px
+  for (const p of parts.values()) {
+    if (p.isSelf || p._x == null) continue;
+    const dx = p._x - px, dy = p._y - py, d2 = dx * dx + dy * dy;
+    if (d2 < best) { best = d2; hit = p; }
+  }
+  if (!hit) return;
+  hit.muted = !hit.muted;
+  const entry = peers.get(hit.id);
+  if (entry && entry.audio) entry.audio.muted = hit.muted;
+}
+
 function frame(t) {
   if (!t0) t0 = t;
   const time = (t - t0) / 1000;
@@ -383,13 +402,14 @@ function drawSonar(time) {
     const ang = seed(p.id, 7) * Math.PI * 2;
     const dist = (0.35 + seed(p.id, 13) * 0.6) * R;
     const x = cx + Math.cos(ang) * dist, y = cy + Math.sin(ang) * dist;
+    p._x = x; p._y = y;          // remembered for tap-to-mute hit testing
 
     // radar persistence: brighten as sweep passes
     let d = ((sweep - ang) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
     const persist = Math.max(0, 1 - d / 0.9);
-    const speaking = p.level > 0.045;
+    const speaking = p.level > 0.045 && !p.muted;
 
-    // speaking ping ripples
+    // speaking ping ripples (suppressed while muted)
     if (speaking) {
       let ph = (ripples.get(p.id) || 0) + 0.022;
       ripples.set(p.id, ph);
@@ -402,17 +422,18 @@ function drawSonar(time) {
     } else ripples.set(p.id, 0);
 
     const glow = Math.min(1, 0.35 + persist * 0.65 + (speaking ? 0.4 : 0));
-    ctx.shadowColor = "#44ff99"; ctx.shadowBlur = 12 * glow;
-    ctx.fillStyle = `rgba(120,255,180,${glow})`;
+    const rgb = p.muted ? "150,150,160" : "120,255,180";
+    ctx.shadowColor = p.muted ? "transparent" : "#44ff99"; ctx.shadowBlur = 12 * glow;
+    ctx.fillStyle = `rgba(${rgb},${p.muted ? 0.4 : glow})`;
     ctx.beginPath(); ctx.arc(x, y, speaking ? 6 : 4.5, 0, Math.PI * 2); ctx.fill();
     ctx.shadowBlur = 0;
 
-    ctx.fillStyle = `rgba(120,255,180,${0.5 + glow * 0.5})`;
+    ctx.fillStyle = `rgba(${rgb},${p.muted ? 0.5 : 0.5 + glow * 0.5})`;
     ctx.font = "12px " + getMono();
     ctx.textBaseline = "middle";
     const flip = x > cx ? -1 : 1;
     ctx.textAlign = flip < 0 ? "right" : "left";
-    ctx.fillText(p.name, x + flip * 10, y);
+    ctx.fillText(p.name + (p.muted ? " (muted)" : ""), x + flip * 10, y);
   }
 
   // self at center
