@@ -1,0 +1,13 @@
+{
+  "name": "vicinity",
+  "version": "1.0.0",
+  "description": "Anonymous proximity voice-chat signaling server (Phase 1).",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
