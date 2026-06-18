@@ -37,6 +37,34 @@ export function geohashEncode(lat, lon, precision = GEOHASH_PRECISION) {
   return hash;
 }
 
+// --- geohash neighbors -------------------------------------------------------
+// Two clients share a room if their cells are equal OR adjacent — so people
+// straddling a cell boundary (or with slightly disagreeing GPS/wifi fixes)
+// still find each other. Standard geohash-js adjacency tables.
+const NEIGHBOR = {
+  n: ["p0r21436x8zb9dcf5h7kjnmqesgutwvy", "bc01fg45238967deuvhjyznpkmstqrwx"],
+  s: ["14365h7k9dcfesgujnmqp0r2twvyx8zb", "238967debc01fg45kmstqrwxuvhjyznp"],
+  e: ["bc01fg45238967deuvhjyznpkmstqrwx", "p0r21436x8zb9dcf5h7kjnmqesgutwvy"],
+  w: ["238967debc01fg45kmstqrwxuvhjyznp", "14365h7k9dcfesgujnmqp0r2twvyx8zb"],
+};
+const BORDER = {
+  n: ["prxz", "bcfguvyz"], s: ["028b", "0145hjnp"],
+  e: ["bcfguvyz", "prxz"], w: ["0145hjnp", "028b"],
+};
+function adjacent(hash, dir) {
+  const last = hash.charAt(hash.length - 1);
+  const type = hash.length % 2;
+  let parent = hash.slice(0, -1);
+  if (BORDER[dir][type].indexOf(last) !== -1 && parent !== "") parent = adjacent(parent, dir);
+  return parent + BASE32.charAt(NEIGHBOR[dir][type].indexOf(last));
+}
+export function neighborhood(hash) {
+  if (!hash) return new Set();
+  const n = adjacent(hash, "n"), s = adjacent(hash, "s"), e = adjacent(hash, "e"), w = adjacent(hash, "w");
+  return new Set([hash, n, s, e, w,
+    adjacent(n, "e"), adjacent(n, "w"), adjacent(s, "e"), adjacent(s, "w")]);
+}
+
 // --- static file serving ----------------------------------------------------
 const CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -69,9 +97,12 @@ const server = http.createServer(serveStatic);
 // clients: id -> { ws, geohash, lat, lon, lastSwitch }
 const clients = new Map();
 
+// Members of the room centered on `geohash` = clients in that cell or any of
+// its 8 neighbors. Symmetric, so A sees B iff B sees A.
 function roomMembers(geohash) {
+  const near = neighborhood(geohash);
   const ids = [];
-  for (const [id, c] of clients) if (c.geohash === geohash) ids.push(id);
+  for (const [id, c] of clients) if (c.geohash && near.has(c.geohash)) ids.push(id);
   return ids;
 }
 
@@ -111,6 +142,7 @@ function enterRoom(id, geohash) {
   if (!c) return;
   const peerIds = roomMembers(geohash).filter((x) => x !== id);
   c.geohash = geohash;
+  console.log(`enter ${id.slice(0, 6)} cell=${geohash} peers=${peerIds.length}`);
   send(c.ws, { type: "peers", peers: peerIds.map((pid) => ({ id: pid, name: nameOf(pid) })) });
   for (const otherId of peerIds) sendTo(otherId, { type: "peer-joined", id, name: nameOf(id) });
 }

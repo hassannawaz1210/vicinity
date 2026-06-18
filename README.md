@@ -39,7 +39,9 @@ npm test   # asserts the inline geohash encoder against a known value
 ## How it works
 
 - On each `loc`, the server computes a precision-7 geohash (standard base32,
-  inline — no dependency). A room = clients sharing that geohash string.
+  inline — no dependency). Your room = clients in your cell **or any of its 8
+  neighbors**, so people near a cell boundary (or with slightly disagreeing
+  GPS/wifi fixes) still match.
 - Entering a room you get the current `peers`; existing members get
   `peer-joined`. Leaving (cell change or disconnect) sends `peer-left`.
 - Cell switches are debounced ~5s to absorb GPS jitter at cell edges.
